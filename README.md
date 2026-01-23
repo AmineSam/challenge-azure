@@ -1,70 +1,60 @@
-# Azure Train Data Project — iRail API
+# Azure Pipeline (iRail API → Azure SQL → Power BI)
 
-**Repository:** `challenge-azure`  
-**Type:** Learning Project (Solo)  
-**Duration:** 2 days  
+## Overview
+This module implements a cloud-native ingestion pipeline for Belgian rail departures using the **iRail API**.
+An **Azure Function App (Python)** ingests liveboard data on a schedule (and via HTTP endpoints), normalizes it, and stores it in **Azure SQL Database**.
 
----
+Primary output: a near real-time dataset and a curated **SQL semantic layer** powering Power BI dashboards (DirectQuery or Import).
 
-## 🎯 Project Overview
+## Architecture
+Services:
+- Azure Function App (Python)
+- Azure SQL Database
+- Azure Storage Account (Function dependency)
+- Application Insights (logs/metrics)
 
-This project implements a **real-world, cloud-native data pipeline** that ingests live Belgian train departure data from the **iRail API**, normalizes it, and stores it in an **Azure SQL Database**, using **Azure Functions (Python)** as the ingestion layer.
-
-The end goal is to power a **near–real-time dashboard** (Power BI) that provides operational insights into train traffic, delays, and station activity in Belgium.
-
----
-
-## 🧠 Project Vision
-
-Using public transport data from iRail, this project demonstrates how to:
-
-- Build a **serverless ingestion pipeline**
-- Design a **SQL schema optimized for live dashboards**
-- Handle **real-time updates + historical observations**
-- Prepare data for **DirectQuery Power BI dashboards**
-- Scale toward production-grade DevOps practices
-
----
-
-## 🏗️ Architecture (Current State)
-
-**Azure Services Used**
-
-| Service | Purpose |
-|------|------|
-| Azure Function App (Python 3.10) | Serverless ingestion & API layer |
-| Azure SQL Database | Persistent storage (stations, departures) |
-| Azure Storage Account | Required Function App dependency |
-| App Service Plan (Consumption) | Auto-scaling execution |
-| Application Insights | Logging & monitoring |
-
-**High-level flow**
-
+Data flow:
 ```
 iRail API
    ↓
 Azure Function (HTTP / Timer)
    ↓
-Azure SQL Database
+Azure SQL (stations, departures_latest, departures_obs)
+   ↓
+SQL Views (Power BI semantic layer)
    ↓
 Power BI (DirectQuery / Liveboard)
 ```
-
 ---
 
-## 📂 Repository Structure
+## Repository structure (pipeline module)
 
 ```
-challenge-azure/
-├── function_app.py        # Azure Functions entrypoint
-├── requirements.txt       # Python dependencies
-├── host.json              # Azure Functions host config
-├── README.md              # Project documentation
+pipeline/
+├── function_app.py # Azure Functions entrypoint
+├── requirements.txt # Python dependencies
+├── host.json # Azure Functions host config
+├── local.settings.json # Local only
+├──README.md
+└── sql/ # DB schema + views (semantic layer)
+   └─ERD
+   └─schema.sql
+   └─views.sql
+   └─README.md
+   
 ```
 
 ---
+## Azure-independent demo
+If the Azure deployment is unavailable (credits expired), the project still remains reviewable via:
+- A portable dataset snapshot (csv)
+- Power BI screenshots
 
-## 🔑 Environment Variables
+See:
+- `../data/` for a portable snapshot
+- `./sql/` for schema and curated views used by Power BI
+---
+## Environment Variables
 
 These **must** be configured in the Function App → *Configuration* → *Application settings*.
 
@@ -76,35 +66,11 @@ These **must** be configured in the Function App → *Configuration* → *Applic
 | `IRAIL_REQ_MIN_INTERVAL_SEC` | Min delay between API calls (rate limiting) |
 | `IRAIL_WRITE_OBS` | `true/false` — enable historical observations |
 
-Example `IRAIL_USER_AGENT`:
-```
-challenge-azure/0.1 (becode; your.email@domain)
-```
-
 ---
 
-## 🗄️ Database Design
+## Azure Functions — Endpoints
 
-### Core Tables
-
-| Table | Purpose |
-|-----|--------|
-| `stations` | Master list of Belgian stations |
-| `departures_latest` | Latest known state per train departure |
-| `departures_obs` | Time-series observations (optional but powerful) |
-
-### Design Rationale
-
-- **`departures_latest`** is optimized for *live dashboards*
-- **`departures_obs`** enables *delay trends, peak hours, reliability*
-- MERGE logic ensures **idempotent ingestion**
-- UTC timestamps everywhere for consistency
-
----
-
-## 🚀 Azure Functions — Endpoints
-
-### 1️⃣ Health Check
+### Health Check
 
 ```
 GET /api/ping
@@ -119,7 +85,7 @@ ok-v7
 
 ---
 
-### 2️⃣ Refresh Stations
+### Refresh Stations
 
 Fetches and upserts **all Belgian stations** from iRail.
 
@@ -133,7 +99,7 @@ GET /api/refresh_stations
 
 ---
 
-### 3️⃣ Ingest Liveboards (Top Stations)
+### Ingest Liveboards (Top Stations)
 
 Fetches live departures for **top-N stations** and updates SQL.
 
@@ -148,74 +114,59 @@ GET /api/ingest_liveboard_top20?limit=20&write_obs=true
 | `limit` | Number of top stations (1–50) |
 | `write_obs` | Store historical snapshots |
 
-**What happens**
-- Calls `/liveboard` endpoint per station
-- MERGE into `departures_latest`
-- Optionally INSERT into `departures_obs`
-- Updates station `last_ingested_at_utc`
+Behavior:
+- Calls iRail liveboard per station
+- Upserts `departures_latest`
+- Optionally inserts into `departures_obs`
+- Updates `stations.last_ingested_at_utc`
 
 ---
 
-### 4️⃣ Liveboard API (SQL-backed)
+### SQL-backed liveboard (no iRail call)
 
-Reads directly from SQL — **no iRail call**.
+`GET /api/liveboard?station_id=BE.NMBS.008821006`
 
-```
-GET /api/liveboard?station_id=BE.NMBS.008821006
-```
-
-**Optional params**
+Optional params:
 - `n` (rows)
 - `minutes_past`
 - `minutes_future`
 
-This endpoint is **Power BI–ready**.
+Intended usage: Power BI-ready read API backed by SQL.
 
 ---
+### Monitoring summary
 
-### 5️⃣ Health / Monitoring Endpoint
+`GET /api/health` 
 
-```
-GET /api/health
-```
-
-Returns:
-- Min / max station ingestion times
-- Latest observation timestamp
-- Latest liveboard update timestamp
-
-Extremely useful for:
-- Debugging refresh issues
-- Power BI monitoring
-- Ops visibility
+Returns ingestion freshness indicators (e.g., last observation time, station ingest range), useful to monitor refresh drift.
 
 ---
+## Automation (timer trigger)
+A timer-triggered function runs automatically:
+- Frequency: every **10 minutes**
+- Purpose: keep `departures_latest` fresh and optionally grow `departures_obs`
 
-## ⏱️ Automation (Timer Trigger)
+## Local development (optional)
+Prerequisites:
+- Python 3.10+
+- Azure Functions Core Tools
 
-A **Timer-triggered Azure Function** runs automatically:
+Run locally:
+1) Create `local.settings.json` (do not commit)
+2) Install deps
+3) Start Functions host
 
-```
-Every 10 minutes
-```
+Notes:
+- Local runs are best for endpoint testing and schema validation.
+- For portfolio review, the offline snapshot + SQL views are sufficient.
 
-Purpose:
-- Keep liveboard data fresh
-- Simulate real-time ingestion
-- Enable DirectQuery dashboards
-
-
-## 🧪 Testing & Validation
-
-- Test endpoints via Azure Portal
-- Validate SQL tables after ingestion
-- Monitor logs in Application Insights
-- Use `/health` for sanity checks
-
-
-
+## Notes & limitations
+- API data can include late updates and temporary inconsistencies.
+- Some fields may be missing depending on iRail availability and station updates.
+- All timestamps are stored in UTC; views may include local time conversions for Belgium.
 ---
 
 ## 👤 Author
 
-**Amine Samoudi**  
+**Amine Samoudi**
+- GitHub: [@AmineSam](https://github.com/AmineSam)
